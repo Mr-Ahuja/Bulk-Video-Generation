@@ -50,11 +50,11 @@ class VideoExportTask(QRunnable):
     def __init__(self, base_dir, images_list, export_params, video_idx):
         """
         base_dir: directory where main.py is located.
-        images_list: list of image file paths (filtered by category; may be relative).
+        images_list: list of image file paths filtered by category (can be relative).
         export_params: dict with keys:
           - images_per_video, width, height, per_image_time, fade_duration,
-            audio_file, output_folder, crossfade (bool)
-        video_idx: integer, the video number (for output filename).
+            audio_file, output_folder, crossfade (bool), closing_image (optional)
+        video_idx: integer, the video number (used in output filename).
         """
         super().__init__()
         self.base_dir = base_dir
@@ -73,6 +73,7 @@ class VideoExportTask(QRunnable):
             audio_file = self.export_params["audio_file"]
             output_folder = self.export_params["output_folder"]
             use_crossfade = self.export_params["crossfade"]
+            closing_image = self.export_params.get("closing_image", None)
 
             # Randomly select images (allow repeats if needed)
             if len(self.images_list) < images_per_video:
@@ -82,7 +83,7 @@ class VideoExportTask(QRunnable):
 
             clips = []
             for img_path in sample_images:
-                # Convert relative path to absolute if needed.
+                # Convert to absolute path if needed.
                 if not os.path.isabs(img_path):
                     img_path = os.path.join(self.base_dir, img_path)
                 if not os.path.isfile(img_path):
@@ -98,29 +99,55 @@ class VideoExportTask(QRunnable):
                     if os.path.exists(cache_file):
                         processed_file = cache_file
                     else:
-                        # Process the image:
                         clip_proc = ImageClip(img_path).resize(height=height)
-                        # If the image width is greater than target, center-crop.
                         if clip_proc.w > width:
                             clip_proc = clip_proc.crop(x_center=clip_proc.w/2, width=width)
-                        # If narrower, pad with black.
                         elif clip_proc.w < width:
                             clip_proc = clip_proc.on_color(
                                 size=(width, height), color=(0, 0, 0), pos=('center', 'center'))
-                        # Save the processed frame to disk.
                         clip_proc.save_frame(cache_file, t=0)
                         processed_file = cache_file
-                # Create a clip from the processed file and set its duration.
                 clip_final = ImageClip(processed_file).set_duration(per_image_time)
                 clips.append(clip_final)
+
+            # Process closing image if provided.
+            closing_clip = None
+            if closing_image and closing_image.strip() != "":
+                if not os.path.isabs(closing_image):
+                    closing_image = os.path.join(self.base_dir, closing_image)
+                if os.path.isfile(closing_image):
+                    # Process closing image in a similar way.
+                    cache_key_close = f"{closing_image}_{width}_{height}"
+                    hash_key_close = hashlib.md5(cache_key_close.encode('utf-8')).hexdigest()
+                    cache_file_close = os.path.join(DISK_CACHE_DIR, f"{hash_key_close}.png")
+                    with DISK_CACHE_LOCK:
+                        if os.path.exists(cache_file_close):
+                            processed_close = cache_file_close
+                        else:
+                            clip_close = ImageClip(closing_image).resize(height=height)
+                            if clip_close.w > width:
+                                clip_close = clip_close.crop(x_center=clip_close.w/2, width=width)
+                            elif clip_close.w < width:
+                                clip_close = clip_close.on_color(
+                                    size=(width, height), color=(0, 0, 0), pos=('center', 'center'))
+                            clip_close.save_frame(cache_file_close, t=0)
+                            processed_close = cache_file_close
+                    closing_clip = ImageClip(processed_close).set_duration(3)  # fixed 3 sec duration
 
             if not clips:
                 raise ValueError("No valid images to process for video creation.")
 
-            # Build final clip (with crossfade if enabled).
+            # Build the final clip.
             if use_crossfade:
-                final_clip = crossfade_consecutive_clips(clips, fade_duration=fade_duration)
+                # If closing image exists, create main clip with crossfade then hard append closing clip.
+                main_clip = crossfade_consecutive_clips(clips, fade_duration=fade_duration)
+                if closing_clip:
+                    final_clip = concatenate_videoclips([main_clip, closing_clip], method="compose")
+                else:
+                    final_clip = main_clip
             else:
+                if closing_clip:
+                    clips.append(closing_clip)
                 final_clip = concatenate_videoclips(clips, method="compose")
 
             # Attach audio if available.
@@ -139,7 +166,7 @@ class VideoExportTask(QRunnable):
                 fps=30,
                 codec="libx264",
                 audio_codec="aac",
-                preset="ultrafast",  # Faster encoding preset
+                preset="ultrafast",
                 verbose=False,
                 logger=None
             )
@@ -158,7 +185,7 @@ class CSVAudioTool(QWidget):
         self.setFixedSize(800, 600)
         self.df = None
         self.threadpool = QThreadPool()
-        self.threadpool.setMaxThreadCount(3)  # Limit to 3 parallel renderings.
+        self.threadpool.setMaxThreadCount(3)
         self.tasks_finished = 0
         self.total_tasks = 0
         self.setupUI()
@@ -229,6 +256,13 @@ class CSVAudioTool(QWidget):
         self.audio_label = QLabel("No audio selected")
         layout.addWidget(self.audio_label)
 
+        # Select Closing Image Field
+        self.closing_image_btn = QPushButton("Select Closing Image")
+        self.closing_image_btn.clicked.connect(self.select_closing_image)
+        layout.addWidget(self.closing_image_btn)
+        self.closing_image_label = QLabel("No closing image selected")
+        layout.addWidget(self.closing_image_label)
+
         # Select Output Folder
         self.output_folder_btn = QPushButton("Select Output Folder")
         self.output_folder_btn.clicked.connect(self.select_output_folder)
@@ -262,6 +296,11 @@ class CSVAudioTool(QWidget):
         audio_path, _ = QFileDialog.getOpenFileName(self, "Select Audio", "", "Audio Files (*.mp3 *.wav *.ogg)")
         if audio_path:
             self.audio_label.setText(audio_path)
+
+    def select_closing_image(self):
+        closing_path, _ = QFileDialog.getOpenFileName(self, "Select Closing Image", "", "Image Files (*.jpg *.png)")
+        if closing_path:
+            self.closing_image_label.setText(closing_path)
 
     def select_output_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -302,7 +341,8 @@ class CSVAudioTool(QWidget):
             "fade_duration": 1,    # Must be less than per_image_time for a smooth fade.
             "audio_file": self.audio_label.text() if self.audio_label.text() != "No audio selected" else None,
             "output_folder": output_folder,
-            "crossfade": True      # Enable crossfade transitions.
+            "crossfade": True,     # Enable crossfade transitions.
+            "closing_image": self.closing_image_label.text() if self.closing_image_label.text() != "No closing image selected" else None
         }
 
         self.total_tasks = export_params["output_videos"]
