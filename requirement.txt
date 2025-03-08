@@ -1,0 +1,5 @@
+PyQt5==5.15.9
+pandas
+moviepy==1.0.3
+imageio-ffmpeg==0.4.7
+Pillow==9.5.0
