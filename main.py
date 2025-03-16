@@ -12,27 +12,28 @@ from PyQt5.QtWidgets import (
     QSpinBox, QSlider, QFileDialog, QMessageBox, QProgressDialog
 )
 
-from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip
+# Import video clip classes from MoviePy.
+from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip, VideoFileClip
 from moviepy.audio.fx import audio_loop
 
 # --------------------- Global Disk Cache Setup ---------------------
 # Use a dedicated subfolder in the system temporary directory.
 DISK_CACHE_DIR = os.path.join(tempfile.gettempdir(), "video_export_cache")
 os.makedirs(DISK_CACHE_DIR, exist_ok=True)
-# Use a lock to protect concurrent disk cache operations.
+# Lock to protect concurrent disk cache operations.
 DISK_CACHE_LOCK = threading.Lock()
 
 # --------------------- Worker Signals ---------------------
 class WorkerSignals(QObject):
-    progress = pyqtSignal(int)  # Emit video index finished
-    error = pyqtSignal(str)     # Emit error message
-    finished = pyqtSignal()     # Emit when a task is done
+    progress = pyqtSignal(int)  # Emit video index finished.
+    error = pyqtSignal(str)     # Emit error message.
+    finished = pyqtSignal()     # Emit when a task is done.
 
 # --------------------- Crossfade Helper ---------------------
 def crossfade_consecutive_clips(clips, fade_duration=1.0):
     """
-    Overlap the last fade_duration seconds of the previous clip with the first fade_duration seconds 
-    of the next clip. Each clip (except the first) is processed with .crossfadein(fade_duration).
+    Overlap the last fade_duration seconds of the previous clip with the first fade_duration
+    seconds of the next clip. Each clip (except the first) is processed with .crossfadein(fade_duration).
     The clips are concatenated with negative padding equal to fade_duration.
     """
     if not clips:
@@ -47,18 +48,18 @@ def crossfade_consecutive_clips(clips, fade_duration=1.0):
 
 # --------------------- Video Export Task ---------------------
 class VideoExportTask(QRunnable):
-    def __init__(self, base_dir, images_list, export_params, video_idx):
+    def __init__(self, base_dir, files_list, export_params, video_idx):
         """
-        base_dir: directory where main.py is located.
-        images_list: list of image file paths filtered by category (can be relative).
-        export_params: dict with keys:
+        base_dir: Directory where main.py is located.
+        files_list: List of file paths (filtered by category; may be relative).
+        export_params: Dictionary with keys:
           - images_per_video, width, height, per_image_time, fade_duration,
             audio_file, output_folder, crossfade (bool), closing_image (optional)
-        video_idx: integer, the video number (used in output filename).
+        video_idx: Integer, the video number (used in output filename).
         """
         super().__init__()
         self.base_dir = base_dir
-        self.images_list = images_list
+        self.files_list = files_list
         self.export_params = export_params
         self.video_idx = video_idx
         self.signals = WorkerSignals()
@@ -75,48 +76,56 @@ class VideoExportTask(QRunnable):
             use_crossfade = self.export_params["crossfade"]
             closing_image = self.export_params.get("closing_image", None)
 
-            # Randomly select images (allow repeats if needed)
-            if len(self.images_list) < images_per_video:
-                sample_images = random.choices(self.images_list, k=images_per_video)
+            # Randomly select files (allow repeats if needed)
+            if len(self.files_list) < images_per_video:
+                sample_files = random.choices(self.files_list, k=images_per_video)
             else:
-                sample_images = random.sample(self.images_list, images_per_video)
+                sample_files = random.sample(self.files_list, images_per_video)
 
             clips = []
-            for img_path in sample_images:
+            for file_path in sample_files:
                 # Convert to absolute path if needed.
-                if not os.path.isabs(img_path):
-                    img_path = os.path.join(self.base_dir, img_path)
-                if not os.path.isfile(img_path):
-                    print(f"File not found: {img_path}")
+                if not os.path.isabs(file_path):
+                    file_path = os.path.join(self.base_dir, file_path)
+                if not os.path.isfile(file_path):
+                    print(f"File not found: {file_path}")
                     continue
 
-                # Compute a cache key based on absolute path and target resolution.
-                cache_key = f"{img_path}_{width}_{height}"
-                hash_key = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
-                cache_file = os.path.join(DISK_CACHE_DIR, f"{hash_key}.png")
+                lower_path = file_path.lower()
+                # If the file is a video, load it as VideoFileClip.
+                if lower_path.endswith((".mp4", ".mov", ".avi")):
+                    clip = VideoFileClip(file_path).resize(newsize=(width, height))
+                    # Ensure uniform resolution by cropping/padding if needed.
+                    if clip.w > width:
+                        clip = clip.crop(x_center=clip.w/2, width=width)
+                    elif clip.w < width:
+                        clip = clip.on_color(size=(width, height), color=(0,0,0), pos=('center', 'center'))
+                    clips.append(clip)
+                else:
+                    # Otherwise assume it's an image.
+                    cache_key = f"{file_path}_{width}_{height}"
+                    hash_key = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
+                    cache_file = os.path.join(DISK_CACHE_DIR, f"{hash_key}.png")
+                    with DISK_CACHE_LOCK:
+                        if os.path.exists(cache_file):
+                            processed_file = cache_file
+                        else:
+                            clip_proc = ImageClip(file_path).resize(height=height)
+                            if clip_proc.w > width:
+                                clip_proc = clip_proc.crop(x_center=clip_proc.w/2, width=width)
+                            elif clip_proc.w < width:
+                                clip_proc = clip_proc.on_color(size=(width, height), color=(0, 0, 0), pos=('center', 'center'))
+                            clip_proc.save_frame(cache_file, t=0)
+                            processed_file = cache_file
+                    clip_final = ImageClip(processed_file).set_duration(per_image_time)
+                    clips.append(clip_final)
 
-                with DISK_CACHE_LOCK:
-                    if os.path.exists(cache_file):
-                        processed_file = cache_file
-                    else:
-                        clip_proc = ImageClip(img_path).resize(height=height)
-                        if clip_proc.w > width:
-                            clip_proc = clip_proc.crop(x_center=clip_proc.w/2, width=width)
-                        elif clip_proc.w < width:
-                            clip_proc = clip_proc.on_color(
-                                size=(width, height), color=(0, 0, 0), pos=('center', 'center'))
-                        clip_proc.save_frame(cache_file, t=0)
-                        processed_file = cache_file
-                clip_final = ImageClip(processed_file).set_duration(per_image_time)
-                clips.append(clip_final)
-
-            # Process closing image if provided.
+            # Process closing image (always assumed to be an image) if provided.
             closing_clip = None
             if closing_image and closing_image.strip() != "":
                 if not os.path.isabs(closing_image):
                     closing_image = os.path.join(self.base_dir, closing_image)
                 if os.path.isfile(closing_image):
-                    # Process closing image in a similar way.
                     cache_key_close = f"{closing_image}_{width}_{height}"
                     hash_key_close = hashlib.md5(cache_key_close.encode('utf-8')).hexdigest()
                     cache_file_close = os.path.join(DISK_CACHE_DIR, f"{hash_key_close}.png")
@@ -128,18 +137,16 @@ class VideoExportTask(QRunnable):
                             if clip_close.w > width:
                                 clip_close = clip_close.crop(x_center=clip_close.w/2, width=width)
                             elif clip_close.w < width:
-                                clip_close = clip_close.on_color(
-                                    size=(width, height), color=(0, 0, 0), pos=('center', 'center'))
+                                clip_close = clip_close.on_color(size=(width, height), color=(0, 0, 0), pos=('center', 'center'))
                             clip_close.save_frame(cache_file_close, t=0)
                             processed_close = cache_file_close
-                    closing_clip = ImageClip(processed_close).set_duration(3)  # fixed 3 sec duration
+                    closing_clip = ImageClip(processed_close).set_duration(3)  # Fixed 3 sec duration
 
             if not clips:
-                raise ValueError("No valid images to process for video creation.")
+                raise ValueError("No valid files to process for video creation.")
 
             # Build the final clip.
             if use_crossfade:
-                # If closing image exists, create main clip with crossfade then hard append closing clip.
                 main_clip = crossfade_consecutive_clips(clips, fade_duration=fade_duration)
                 if closing_clip:
                     final_clip = concatenate_videoclips([main_clip, closing_clip], method="compose")
@@ -159,7 +166,6 @@ class VideoExportTask(QRunnable):
                     audio_clip = audio_clip.subclip(0, final_clip.duration)
                 final_clip = final_clip.set_audio(audio_clip)
 
-            # Write the final video using 30 fps and a faster encoding preset.
             output_path = os.path.join(output_folder, f"video_{self.video_idx}.mp4")
             final_clip.write_videofile(
                 output_path,
@@ -172,7 +178,6 @@ class VideoExportTask(QRunnable):
             )
 
             self.signals.progress.emit(self.video_idx)
-
         except Exception as e:
             self.signals.error.emit(f"Error in video {self.video_idx}: {e}")
         self.signals.finished.emit()
@@ -325,11 +330,11 @@ class CSVAudioTool(QWidget):
         except Exception:
             width, height = 1920, 1080
 
-        # Pre-filter images by category.
+        # Pre-filter files by category.
         category = self.category_combo.currentText()
-        images_list = self.df[self.df["Category"] == category]["File"].dropna().tolist()
-        if not images_list:
-            self.show_error("No images found for the selected category.")
+        files_list = self.df[self.df["Category"] == category]["File"].dropna().tolist()
+        if not files_list:
+            self.show_error("No files found for the selected category.")
             return
 
         export_params = {
@@ -359,7 +364,7 @@ class CSVAudioTool(QWidget):
 
         # Launch a task for each video.
         for video_idx in range(1, export_params["output_videos"] + 1):
-            task = VideoExportTask(base_dir, images_list, export_params, video_idx)
+            task = VideoExportTask(base_dir, files_list, export_params, video_idx)
             task.signals.progress.connect(self.on_task_progress)
             task.signals.error.connect(self.on_task_error)
             task.signals.finished.connect(self.on_task_finished)
